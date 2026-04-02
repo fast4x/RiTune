@@ -46,6 +46,7 @@ android {
         }
     }
 
+    /*
     applicationVariants.all {
         val variant = this
         variant.outputs
@@ -55,6 +56,7 @@ android {
                 output.outputFileName = outputFileName
             }
     }
+     */
 }
 
 dependencies {
