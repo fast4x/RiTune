@@ -81,6 +81,7 @@ dependencies {
     implementation(libs.ktor.server.call.logging)
     implementation(libs.logback.classic)
     implementation(libs.serialization.json)
+    implementation("androidx.compose.material:material-icons-extended")
 
 
     testImplementation(libs.junit)
