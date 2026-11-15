@@ -42,6 +42,15 @@
 # PRE-RELEASE (SemVer 2.0.0): come nella proforma, tag come v0.0.2-rc.1
 # producono una GitHub Release marcata "pre-release" (non diventa "Latest").
 #
+# LINK STABILE ALL'ULTIMO APK (per gli URL shortener):
+#  oltre all'APK versionato (RiTune-<tag>-Android.apk) ogni release allega
+#  anche la copia con nome fisso RiTune.apk (stesso APK, stessa firma).
+#  GitHub espone cosi' l'URL permanente
+#      https://github.com/<owner>/<repo>/releases/latest/download/RiTune.apk
+#  che fa da redirect 302 all'asset dell'ULTIMA release NON pre-release:
+#  lo shortener puo' puntare a un link che non cambia mai, qualsiasi sia
+#  il nome dell'APK versionato di turno.
+#
 # NB: jpackage e la versione numerica non servono qui (solo Android); il
 #     versionCode/versionName restano quelli dichiarati in build.gradle.kts.
 # ==============================================================================
@@ -289,6 +298,25 @@ jobs:
           echo "📂 Dopo rinomina:"
           find . -maxdepth 1 -type f | sort
 
+      # Alias a nome FISSO: copia byte-per-byte dell'APK versionato con un
+      # nome che non cambia mai. E' l'ancora del link stabile
+      #   https://github.com/<owner>/<repo>/releases/latest/download/RiTune.apk
+      # che GitHub risolve SEMPRE sull'ultima release non pre-release: lo
+      # shortener puo' puntare li' per sempre, qualsiasi sia il nome
+      # dell'APK versionato di turno.
+      - name: Create fixed-name alias for the latest-download link
+        env:
+          CURRENT_TAG: ${{ needs.validate.outputs.version }}
+        run: |
+          APK=$(ls -1 release-assets/RiTune-${CURRENT_TAG}-Android*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::impossibile creare l'alias: APK versionato non trovato (pattern RiTune-${CURRENT_TAG}-Android*.apk)"
+            exit 1
+          fi
+          cp "$APK" release-assets/RiTune.apk
+          echo "✅ Alias creato: $(basename "$APK") -> RiTune.apk (stesso APK, stessa firma)"
+          sha256sum "$APK" release-assets/RiTune.apk
+
       # Verifica GLI ASSET ATTESI prima di creare la release: un asset
       # mancante esce come ::error:: esplicito, mai silenzio (STEP 3y)
       - name: Verifica asset attesi prima della release
@@ -369,6 +397,7 @@ jobs:
             echo "### 📦 Downloads"
             echo "**Android**"
             echo "- **APK** (signed release build: RiTune-${CURRENT_TAG}-Android.apk)"
+            echo "- **Permanent link to the latest APK** (same file as above, URL never changes): [RiTune.apk](https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/RiTune.apk)"
             echo ""
             echo "### ✨ Build Information"
             echo "- **Build Date**: ${RELEASE_DATE}"
