@@ -5,6 +5,27 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+// =============================================================================
+// FIRMA RELEASE CI (stessa tecnica del workflow .github/workflows/build-release.yml)
+// -----------------------------------------------------------------------------
+// Il workflow GitHub Actions:
+//   1. decodifica il keystore dai secrets in $RUNNER_TEMP/keystore/
+//      RiTuneKeystore.jks (mai nel workspace, mai negli artifact; rimosso
+//      dopo la build con if: always());
+//   2. passa le credenziali alla build via variabili d'ambiente:
+//        SIGNING_STORE_FILE      -> percorso del keystore decodificato
+//        SIGNING_STORE_PASSWORD  -> password del keystore (secret KEYSTORE_PASSWORD)
+//        SIGNING_KEY_ALIAS       -> alias della chiave    (secret KEY_ALIAS)
+//        SIGNING_KEY_PASSWORD    -> password della chiave (secret KEY_PASSWORD)
+// Il signingConfig "ciRelease" qui sotto legge ESATTAMENTE quelle variabili:
+// in CI l'APK release esce firmato; in locale (env assenti) nessun
+// signingConfig viene creato e la release resta unsigned come prima.
+// =============================================================================
+val ciStoreFile = System.getenv("SIGNING_STORE_FILE")
+val ciStorePassword = System.getenv("SIGNING_STORE_PASSWORD")
+val ciKeyAlias = System.getenv("SIGNING_KEY_ALIAS")
+val ciKeyPassword = System.getenv("SIGNING_KEY_PASSWORD")
+
 android {
     namespace = "it.fast4x.ritune"
     compileSdk = 35
@@ -19,6 +40,30 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Fail-fast esplicito (filosofia della proforma: mai in silenzio): se le
+    // env di firma sono parzialmente impostate o il keystore non esiste, la
+    // configurazione Gradle muore subito con messaggio chiaro.
+    if (ciStoreFile != null) {
+        require(ciStorePassword != null && ciKeyAlias != null && ciKeyPassword != null) {
+            "Firma release CI incompleta: impostare TUTTE le variabili " +
+                "SIGNING_STORE_FILE, SIGNING_STORE_PASSWORD, SIGNING_KEY_ALIAS, SIGNING_KEY_PASSWORD"
+        }
+        require(file(ciStoreFile).exists()) {
+            "Firma release CI: keystore non trovato: $ciStoreFile"
+        }
+    }
+
+    signingConfigs {
+        if (ciStoreFile != null) {
+            create("ciRelease") {
+                storeFile = file(ciStoreFile)
+                storePassword = ciStorePassword
+                keyAlias = ciKeyAlias
+                keyPassword = ciKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -26,6 +71,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Firma CI: con le env impostate (workflow) l'APK esce firmato;
+            // senza env (build locale) resta unsigned, come prima della patch.
+            if (ciStoreFile != null) {
+                signingConfig = signingConfigs.getByName("ciRelease")
+            }
         }
     }
     compileOptions {

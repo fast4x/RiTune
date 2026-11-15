@@ -1,0 +1,405 @@
+# =============================================================================
+# build-release.yml - WORKFLOW di build/rilascio RiTune
+#
+# Portato dalla proforma RiPlay (build-release.yml): STESSA TECNICA DI FIRMA,
+# adattato alla struttura reale di RiTune (singolo modulo Android ":app",
+# nessun product flavor, nessun target desktop -> i job desktop MSI/DEB/RPM/
+# DMG/AppImage, gli archivi 7z AVD/WSA/WAYDROID e la scelta "targets" della
+# proforma sono stati rimossi perche' qui non hanno oggetto).
+#
+#   ANDROID : APK release FIRMATO (task :app:assembleRelease)
+#   RELEASE : una sola GitHub Release sul tag con l'APK rinominato + changelog
+#
+# Trigger:
+#  - push di un tag v*            -> costruisce e pubblica la release sul tag
+#  - workflow_dispatch (manuale)  -> si sceglie la "version" (es. v0.0.2 o
+#                                    v0.0.2-rc.1); la run parte sempre da main
+#
+# SECRETS RICHIESTI (da creare nel repo - STESSI NOMI della proforma RiPlay):
+#  - KEYSTORE_BASE64    : keystore .jks codificato in base64 SU UNA RIGA
+#                         (generazione: base64 -w0 RiTuneKeystore.jks)
+#  - KEYSTORE_PASSWORD  : password del keystore
+#  - KEY_ALIAS          : alias della chiave di firma
+#  - KEY_PASSWORD       : password della chiave
+#
+# TECNICA DI FIRMA (identica alla proforma, 3 passaggi):
+#  1) il keystore base64 viene decodificato SOLO in $RUNNER_TEMP/keystore/
+#     (mai nel workspace, mai negli artifact) con chmod 600;
+#  2) le credenziali passano alla build Gradle via env SIGNING_*: il
+#     build.gradle.kts di :app (patchato insieme a questo workflow) crea il
+#     signingConfig "ciRelease" che legge ESATTAMENTE quelle variabili;
+#     senza env (build locale) la release resta unsigned, senza errori;
+#  3) pulizia del keystore con if: always() (anche a build fallita).
+#
+# CANARINI (filosofia della proforma: mai fallimenti in silenzio):
+#  - "Verifica gradlew": errore esplicito se mancano gli script wrapper
+#    (il zip dei sorgenti contiene jar+properties ma non gli script gradlew);
+#  - "Verifica APK firmato": fallisce se non esce nessun APK, se esce un
+#    *-unsigned.apk, e verifica la firma reale con apksigner (--print-certs);
+#  - il job release verifica l'asset atteso PRIMA di creare la release ed
+#    esce con ::error:: se manca (niente release incomplete in silenzio).
+#
+# PRE-RELEASE (SemVer 2.0.0): come nella proforma, tag come v0.0.2-rc.1
+# producono una GitHub Release marcata "pre-release" (non diventa "Latest").
+#
+# NB: jpackage e la versione numerica non servono qui (solo Android); il
+#     versionCode/versionName restano quelli dichiarati in build.gradle.kts.
+# ==============================================================================
+
+name: Build and Release RiTune
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.0.2 or v0.0.2-rc.1)'
+        required: true
+        type: string
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permessi espliciti per creare la release e caricare gli asset
+# (con token di default read-only la release fallirebbe con 403
+# "Resource not accessible by integration")
+permissions:
+  contents: write
+
+jobs:
+  # ===========================================================================
+  # 1) VALIDAZIONE: formato versione + tag non esistente + sync a main
+  # ===========================================================================
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      # true se la versione ha un suffisso pre-release (-rc, -beta...)
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch latest commits
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          echo "✅ Synced to latest commit on main"
+
+      - name: Validate version format and check if tag exists
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          # input passato via env, non iniettato nello script (come proforma)
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          # Accetta anche il suffisso pre-release SemVer 2.0.0 (v0.0.2-rc.1,
+          # v0.0.2-beta.1, ...): le tre componenti numeriche restano obbligatorie
+          if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "❌ Invalid version format! Use v0.0.2 or a pre-release like v0.0.2-rc.1"
+            exit 1
+          fi
+
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "❌ Tag $VERSION already exists!"
+            exit 1
+          fi
+
+          echo "✅ Version $VERSION is valid and new"
+
+      - name: Resolve version output
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          CURRENT_TAG="$INPUT_VERSION"
+          if [ -z "$CURRENT_TAG" ]; then
+            CURRENT_TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "version=$CURRENT_TAG" >> "$GITHUB_OUTPUT"
+
+          # pre-release = suffisso SemVer dopo la terza componente numerica.
+          # Vale per ENTRAMBI i trigger (dispatch e push del tag); l'output
+          # viene usato dal job release per marcare la GitHub Release.
+          if [[ "$CURRENT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "🏷️ $CURRENT_TAG e' una pre-release: la GitHub Release sara' marcata 'pre-release' (non diventa 'Latest')"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ===========================================================================
+  # 2) ANDROID: APK release FIRMATO (stessa tecnica di firma della proforma)
+  # ===========================================================================
+  build-apk:
+    needs: validate
+    runs-on: ubuntu-latest
+    # Se la build si blocca, fallisce dopo N minuti invece di restare appeso
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch latest commits
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Verifica gradlew nel repo
+        shell: bash
+        run: |
+          if [ ! -f gradlew ]; then
+            echo "::error::gradlew non presente nel repo: committare gradlew e gradlew.bat (gradle-wrapper.jar e gradle-wrapper.properties sono gia' nel repo)"
+            exit 1
+          fi
+          echo "OK: gradlew presente"
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # TECNICA DI FIRMA (1/3): decodifica keystore dai secrets in RUNNER_TEMP
+      # (fuori dal workspace: non finisce mai negli artifact/cache)
+      - name: Decode keystore from secrets to temp directory
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "${RUNNER_TEMP}/keystore/RiTuneKeystore.jks"
+          chmod 600 "${RUNNER_TEMP}/keystore/RiTuneKeystore.jks"
+
+      # TECNICA DI FIRMA (2/3): credenziali passate alla build via env SIGNING_*
+      # Il build.gradle.kts di :app crea il signingConfig "ciRelease" che
+      # legge esattamente queste variabili (vedi patch app/build.gradle.kts
+      # allegata a questo workflow)
+      - name: Build Release APK
+        env:
+          SIGNING_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SIGNING_STORE_FILE: ${{ runner.temp }}/keystore/RiTuneKeystore.jks
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      # TECNICA DI FIRMA (3/3): pulizia anche a build fallita (if: always())
+      - name: Clean up sensitive files
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP}/keystore"
+          echo "✅ Keystore removed from temporary directory"
+
+      # Il pattern di raccolta usa UN solo search path -> root dell'artifact
+      # piatta (lezione STEP 3y della proforma: niente annidamenti LCA)
+      - name: Collect APK
+        run: |
+          mkdir -p release-apks
+          find app -name "*.apk" -path "*/release/*" -exec cp {} release-apks/ \;
+          ls -lah release-apks/
+
+      # Canarini: la release non deve mai partire con un APK unsigned o assente
+      - name: Verifica APK firmato
+        run: |
+          n=$(ls -1 release-apks/*.apk 2>/dev/null | wc -l)
+          if [ "$n" -eq 0 ]; then
+            echo "::error::nessun APK prodotto sotto app/ (*/release/*)"
+            exit 1
+          fi
+          if ls release-apks/*-unsigned.apk >/dev/null 2>&1; then
+            echo "::error::APK UNSIGNED rilevato: signingConfig CI non applicato (env SIGNING_* assenti o patch build.gradle.kts non applicata)"
+            exit 1
+          fi
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner non trovato in \$ANDROID_HOME/build-tools"
+            exit 1
+          fi
+          for apk in release-apks/*.apk; do
+            echo "🔎 Verifica firma: $apk"
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
+          echo "✅ Firma APK verificata (v1/v2 secondo minSdk)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: release-apks/*.apk
+          retention-days: 1
+
+  # ===========================================================================
+  # 3) RELEASE: raccoglie l'artifact, rinomina, verifica e pubblica UNA
+  #    GitHub Release sul tag con changelog (meccanica della proforma)
+  # ===========================================================================
+  release:
+    needs: [validate, build-apk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Ogni artifact finisce in una SUA sottocartella (niente merge)
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Normalize asset names
+        env:
+          CURRENT_TAG: ${{ needs.validate.outputs.version }}
+        run: |
+          cd release-assets
+          echo "📂 Artifacts scaricati:"
+          find . -type f | sort
+
+          # Nomi canonici per la release (se un artifact contiene piu' file
+          # con la stessa estensione, vengono numerati -1, -2, ...)
+          rename_artifact() { # $1=artifact_dir $2=extension $3=base canonico
+            local files n i=1 f
+            files=$(ls "$1"/*."$2" 2>/dev/null || true)
+            [ -z "$files" ] && return 0
+            n=$(echo "$files" | wc -l)
+            for f in $files; do
+              if [ "$n" -eq 1 ]; then
+                cp "$f" "${3}.${2}"
+              else
+                cp "$f" "${3}-${i}.${2}"
+              fi
+              i=$((i+1))
+            done
+          }
+          rename_artifact apk-release apk "RiTune-${CURRENT_TAG}-Android"
+
+          echo "📂 Dopo rinomina:"
+          find . -maxdepth 1 -type f | sort
+
+      # Verifica GLI ASSET ATTESI prima di creare la release: un asset
+      # mancante esce come ::error:: esplicito, mai silenzio (STEP 3y)
+      - name: Verifica asset attesi prima della release
+        env:
+          CURRENT_TAG: ${{ needs.validate.outputs.version }}
+        run: |
+          cd release-assets
+          echo "=== Inventario artifact scaricati (2 livelli) ==="
+          find . -mindepth 1 -maxdepth 2 | sort
+          missing=0
+          check() { # $1=pattern glob $2=descrizione
+            if ls -1 $1 >/dev/null 2>&1; then
+              echo "✅ $2: $(ls -1 $1 | tr '\n' ' ')"
+            else
+              echo "❌ $2: MANCANTE (pattern: $1)"
+              missing=$((missing+1))
+            fi
+          }
+          check "RiTune-${CURRENT_TAG}-Android*.apk" "APK Android (firmato)"
+          echo "Asset attesi mancanti: ${missing}"
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::asset attesi mancanti in release-assets — la release NON verra' creata incompleta. Vedi l'inventario sopra."
+            exit 1
+          fi
+
+      # Elenco DINAMICO e concreto dei file da allegare (solo file realmente
+      # presenti); con fail_on_unmatched_files ogni anomalia fallisce comunque
+      - name: Prepara elenco file per la release
+        run: |
+          LIST=$(find release-assets -maxdepth 1 -type f | sort)
+          echo "📂 File che verranno allegati alla release:"
+          echo "$LIST"
+          {
+            echo "RELEASE_FILES<<RFILES_EOF"
+            echo "$LIST"
+            echo "RFILES_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate Changelog
+        env:
+          CURRENT_TAG: ${{ needs.validate.outputs.version }}
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-version:refname --list "v*" --merged HEAD | grep -v "^${CURRENT_TAG}$" | head -1)
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "⚠️  No previous tag found - showing all commits"
+            # GITHUB_REPOSITORY e' una env di default; || true evita fallimento
+            # se grep filtra tutte le righe
+            git log --pretty=format:"- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))" --reverse | head -20 > /tmp/changelog.txt || true
+          else
+            echo "📋 Changes between $PREVIOUS_TAG and $CURRENT_TAG"
+            git log "${PREVIOUS_TAG}..HEAD" --pretty=format:"- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))" > /tmp/changelog.txt || true
+          fi
+
+          echo "" >> /tmp/changelog.txt
+
+      - name: Create Release Notes
+        env:
+          CURRENT_TAG: ${{ needs.validate.outputs.version }}
+          IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          RELEASE_DATE=$(date +'%Y-%m-%d')
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+
+          {
+            echo "## 🎵 RiTune ${CURRENT_TAG} - Released ${RELEASE_DATE}"
+            echo ""
+            # avviso ben visibile sulle pre-release
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              echo "> ⚠️ **RELEASE CANDIDATE**: test version. It may contain bugs and does NOT replace the latest stable release."
+              echo ""
+            fi
+            echo "### 📋 What's Changed"
+            # Il changelog viene letto da file: bash non interpreta
+            # virgolette, backtick o parentesi nei messaggi di commit
+            cat /tmp/changelog.txt
+            echo ""
+            echo "### 📦 Downloads"
+            echo "**Android**"
+            echo "- **APK** (signed release build: RiTune-${CURRENT_TAG}-Android.apk)"
+            echo ""
+            echo "### ✨ Build Information"
+            echo "- **Build Date**: ${RELEASE_DATE}"
+            echo "- **Git Commit**: \`${COMMIT_HASH}\`"
+            echo "- **Java Version**: 21"
+            echo ""
+            echo "**Thank you for using RiTune!** 🎵"
+          } > /tmp/release_notes.md
+
+      # action-gh-release v3 (come proforma): overwrite_files permette il
+      # re-run sullo stesso tag SOVRASCRIVENDO gli asset omonimi; l'elenco
+      # file e' quello dinamico preparato sopra
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.RELEASE_FILES }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          body_path: /tmp/release_notes.md
+          draft: false
+          # una release candidate viene marcata "pre-release" su GitHub:
+          # non compare come "Latest"
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          tag_name: ${{ needs.validate.outputs.version }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Summary
+        if: success()
+        run: |
+          echo "✅ Release completed successfully!"
+          echo "📦 Release files:"
+          find release-assets -maxdepth 1 -type f -exec du -h {} \; | sort -k2
