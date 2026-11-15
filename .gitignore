@@ -16,3 +16,4 @@ local.properties
 /.idea/
 /.kotlin/
 /APK Keystore/
+/fastlane/it.fast4x.ritune.yml

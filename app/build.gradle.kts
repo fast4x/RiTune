@@ -96,6 +96,12 @@ android {
         }
     }
 
+    dependenciesInfo {
+        // Rimuove il blocco "Dependency metadata" dal APK Signing Block
+        includeInApk = false
+        includeInBundle = false
+    }
+
     /*
     applicationVariants.all {
         val variant = this
