@@ -1,0 +1,1 @@
+"C:\Users\russor\AppData\Local\Android\Sdk\build-tools\36.1.0\apksigner.bat" verify --print-certs ./app/release/app-release.apk
