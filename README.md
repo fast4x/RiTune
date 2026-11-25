@@ -43,7 +43,7 @@ You can download the latest version of RiTune directly from the releases page:
 
 **[Download Latest Release](https://github.com/fast4x/RiTune/releases)**
 
-For faster downloads to your TV, you can use [AFTVnews Downloader](https://www.aftvnews.com/downloader/) and enter the code **1178386**, or use your web browser and enter this link: [https://aftv.news/1178386](https://aftv.news/1178386) 
+For faster downloads to your TV, you can use [AFTVnews Downloader](https://www.aftvnews.com/downloader/) and enter the code **2587462**, or use your web browser and enter this link: [https://aftv.news/2587462](https://aftv.news/2587462) 
 
 <sub><em>— Thanks to [elvarHex](https://github.com/elvarHex) for the AFTVnews Downloader integration —</em></sub>
 
