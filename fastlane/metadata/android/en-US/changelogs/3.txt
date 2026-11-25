@@ -1,0 +1,2 @@
+* Improve IP address detection, now include support for Ethernet, beyond Wi-Fi and network interface fallback.
+
